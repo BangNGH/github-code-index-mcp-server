@@ -4,6 +4,8 @@ Code Index MCP Server
 This MCP server allows LLMs to index, search, and analyze code from a project directory.
 It provides tools for file discovery, content retrieval, and code analysis.
 """
+import random
+import string
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, List, Optional, Tuple, Any
@@ -13,10 +15,15 @@ import json
 import fnmatch
 import sys
 from mcp.server.fastmcp import FastMCP, Context, Image
-from mcp import types
+from mcp import ServerSession, types
+
+from service.github_service import git_clone, git_pull
 
 # Import the ProjectSettings class - using relative import
 from .project_settings import ProjectSettings
+
+DEFAULT_CLONE_PATH = os.path.join(os.getcwd(), "cloned_repos")
+os.makedirs(DEFAULT_CLONE_PATH, exist_ok=True)
 
 # Create the MCP server
 mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
@@ -196,6 +203,34 @@ def get_settings_stats() -> str:
     
     return json.dumps(stats, indent=2)
 
+
+# -- Code Indexer Tools --
+
+@mcp.tool()
+def index_github_repo(repo_url: str, ctx: Context, branch: Optional[str] = None) -> str:
+    """
+    Clone a Git repository and set it as the current project path for indexing.
+    """
+    # Generate a random string for the target path
+    random_string = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    target_path = os.path.join(DEFAULT_CLONE_PATH, random_string)
+    # First, clone the repository
+    try:
+        # Perform the clone operation without relying on git_clone_tool
+        clone_result = git_clone(repo_url, target_path, branch)
+        
+        if "Error" in clone_result:
+            return clone_result
+        
+        # Then set the project path to the cloned repository
+        # This will correctly set up all the context for us
+        set_result = set_project_path(target_path, ctx)
+        
+        return f"{clone_result}\n\n{set_result}"
+    except Exception as e:
+        return f"Error cloning and setting project: {str(e)}"
+
+
 # ----- TOOLS -----
 
 @mcp.tool()
@@ -274,12 +309,16 @@ def set_project_path(path: str, ctx: Context) -> str:
         return f"Error setting project path: {e}"
 
 @mcp.tool()
-def search_code(query: str, ctx: Context, extensions: Optional[List[str]] = None, case_sensitive: bool = False) -> Dict[str, List[Tuple[int, str]]]:
+def search_code(query: str, input_path: str, ctx: Context, extensions: Optional[List[str]] = None, case_sensitive: bool = False) -> Dict[str, List[Tuple[int, str]]]:
     """
     Search for code matches within the indexed files.
     Returns a dictionary mapping filenames to lists of (line_number, line_content) tuples.
     """
-    base_path = ctx.request_context.lifespan_context.base_path
+    input_path = os.path.normpath(input_path)
+    if input_path.startswith('..'):
+        return {"error": f"Invalid file path: {input_path}"}
+
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
     
     # Check if base_path is set
     if not base_path:
@@ -332,12 +371,15 @@ def search_code(query: str, ctx: Context, extensions: Optional[List[str]] = None
     return results
 
 @mcp.tool()
-def find_files(pattern: str, ctx: Context) -> List[str]:
+def find_files(pattern: str, input_path: str, ctx: Context) -> List[str]:
     """
     Find files in the project that match the given pattern.
     Supports glob patterns like *.py or **/*.js.
     """
-    base_path = ctx.request_context.lifespan_context.base_path
+    input_path = os.path.normpath(input_path)
+    if input_path.startswith('..'):
+        return {"error": f"Invalid file path: {input_path}"}
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
     
     # Check if base_path is set
     if not base_path:
@@ -357,7 +399,7 @@ def find_files(pattern: str, ctx: Context) -> List[str]:
     return matching_files
 
 @mcp.tool()
-def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
+def get_file_summary(file_path: str, input_path: str, ctx: Context, include_file_content: bool = False) -> Dict[str, Any]:
     """
     Get a summary of a specific file, including:
     - Line count
@@ -365,7 +407,10 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
     - Import statements
     - Basic complexity metrics
     """
-    base_path = ctx.request_context.lifespan_context.base_path
+    input_path = os.path.normpath(input_path)
+    if input_path.startswith('..'):
+        return {"error": f"Invalid file path: {input_path}"}
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
     
     # Check if base_path is set
     if not base_path:
@@ -396,12 +441,15 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
         # File extension for language-specific analysis
         _, ext = os.path.splitext(norm_path)
         
+        
         summary = {
             "file_path": norm_path,
             "line_count": line_count,
             "size_bytes": os.path.getsize(full_path),
             "extension": ext,
         }
+        if include_file_content:
+            summary["file_content"] = content
         
         # Language-specific analysis
         if ext == '.py':
@@ -485,10 +533,14 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
         return {"error": f"Error analyzing file: {e}"}
 
 @mcp.tool()
-def refresh_index(ctx: Context) -> str:
+def refresh_index(input_path: str, ctx: Context) -> str:
     """Refresh the project index."""
-    base_path = ctx.request_context.lifespan_context.base_path
-    
+    input_path = os.path.normpath(input_path)
+    if input_path.startswith('..'):
+        return {"error": f"Invalid file path: {input_path}"}
+
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
+
     # Check if base_path is set
     if not base_path:
         return "Error: Project path not set. Please use set_project_path to set a project directory first."
@@ -496,6 +548,12 @@ def refresh_index(ctx: Context) -> str:
     # Clear existing index
     global file_index
     file_index.clear()
+    
+    # Pull for latest changes
+    try:
+        git_pull(base_path)
+    except Exception as e:
+        return f"Failed to pull latest changes. Project re-index failed. Project path: {base_path}. Error: {e}"
     
     # Re-index the project
     file_count = _index_project(base_path)
@@ -602,8 +660,8 @@ def set_project() -> list[types.PromptMessage]:
         Before I can help you analyze any code, we need to set up the project path. This is a required first step.
         
         Please provide the full path to your project folder. For example:
-        - Windows: "C:/Users/username/projects/my-project"
-        - macOS/Linux: "/home/username/projects/my-project"
+        - Windows: "C:/Users/input_path/projects/my-project"
+        - macOS/Linux: "/home/input_path/projects/my-project"
         
         Once you provide the path, I'll use the `set_project_path` tool to configure the code analyzer to work with your project.
         """))
@@ -692,7 +750,7 @@ def _get_all_files(directory: Dict, prefix: str = "") -> List[Tuple[str, Dict]]:
 def main():
     """Entry point for the code indexer."""
     print("Starting Code Index MCP Server...", file=sys.stderr)
-    mcp.run()
+    mcp.run(transport="sse")
 
 if __name__ == "__main__":
     main()
