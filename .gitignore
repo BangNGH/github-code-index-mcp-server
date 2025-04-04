@@ -37,3 +37,4 @@ Thumbs.db
 
 # Code Index MCP specific files
 .code_indexer/
+cloned_repos/
