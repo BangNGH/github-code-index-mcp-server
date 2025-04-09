@@ -29,3 +29,36 @@ def git_pull(repo_path: str) -> str:
         return f"Successfully pulled changes from {repo.git_dir}"
     except Exception as e:
         return f"Error pulling changes from repository: {str(e)}"
+    
+def git_status(repo: git.Repo) -> str:
+    return repo.git.status()
+
+def git_log(repo: git.Repo, max_count: int = 10) -> list[str]:
+    commits = list(repo.iter_commits(max_count=max_count))
+    log = []
+    for commit in commits:
+        log.append(
+            f"Commit: {commit.hexsha}\n"
+            f"Author: {commit.author}\n"
+            f"Date: {commit.authored_datetime}\n"
+            f"Message: {commit.message}\n"
+        )
+    return log
+
+def git_show(repo: git.Repo, revision: str) -> str:
+    commit = repo.commit(revision)
+    output = [
+        f"Commit: {commit.hexsha}\n"
+        f"Author: {commit.author}\n"
+        f"Date: {commit.authored_datetime}\n"
+        f"Message: {commit.message}\n"
+    ]
+    if commit.parents:
+        parent = commit.parents[0]
+        diff = parent.diff(commit, create_patch=True)
+    else:
+        diff = commit.diff(git.NULL_TREE, create_patch=True)
+    for d in diff:
+        output.append(f"\n--- {d.a_path}\n+++ {d.b_path}\n")
+        output.append(d.diff.decode('utf-8'))
+    return "".join(output)

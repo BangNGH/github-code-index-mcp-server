@@ -4,6 +4,7 @@ Code Index MCP Server
 This MCP server allows LLMs to index, search, and analyze code from a project directory.
 It provides tools for file discovery, content retrieval, and code analysis.
 """
+import datetime
 import random
 import string
 from contextlib import asynccontextmanager
@@ -14,13 +15,14 @@ import pathlib
 import json
 import fnmatch
 import sys
+import git
 from mcp.server.fastmcp import FastMCP, Context, Image
 from mcp import ServerSession, types
 
-from service.github_service import git_clone, git_pull
+from service.github_service import git_clone, git_log, git_pull, git_show, git_status
 
 # Import the ProjectSettings class - using relative import
-from .project_settings import ProjectSettings
+from code_index_mcp.project_settings import ProjectSettings
 
 DEFAULT_CLONE_PATH = os.path.join(os.getcwd(), "cloned_repos")
 os.makedirs(DEFAULT_CLONE_PATH, exist_ok=True)
@@ -36,6 +38,9 @@ supported_extensions = [
     '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.rs', '.scala', '.sh',
     '.bash', '.html', '.css', '.scss', '.md', '.json', '.xml', '.yml', '.yaml'
 ]
+
+# Store indexed commits data
+commit_index = {}
 
 @dataclass
 class CodeIndexerContext:
@@ -206,6 +211,321 @@ def get_settings_stats() -> str:
 
 # -- Code Indexer Tools --
 
+
+def git_index_commits(repo: git.Repo, max_commits: int = 100, index_file_content: bool = True) -> dict:
+    """
+    Index commit history for searching.
+    Returns statistics about the indexing process.
+    """
+    global commit_index
+    repo_path = repo.working_dir
+    
+    # Initialize index structure for this repo if it doesn't exist
+    if repo_path not in commit_index:
+        commit_index[repo_path] = {
+            "commits": {},
+            "files": {},
+            "last_indexed": None
+        }
+    
+    index_data = commit_index[repo_path]
+    
+    # Get commits to index
+    commits = list(repo.iter_commits(max_count=max_commits))
+    
+    # Track stats
+    stats = {
+        "total_commits": len(commits),
+        "indexed_commits": 0,
+        "indexed_files": 0,
+        "indexed_content_size_bytes": 0
+    }
+    
+    # Process each commit
+    for commit in commits:
+        commit_hash = commit.hexsha
+        
+        # Skip if already indexed
+        if commit_hash in index_data["commits"]:
+            continue
+            
+        # Get basic commit info
+        commit_info = {
+            "hash": commit_hash,
+            "short_hash": commit.hexsha[:7],
+            "author": str(commit.author),
+            "author_email": commit.author.email,
+            "date": commit.authored_datetime.isoformat(),
+            "message": commit.message,
+            "changed_files": [],
+            "file_content": {}
+        }
+        
+        # Get file changes
+        if commit.parents:
+            parent = commit.parents[0]
+            diffs = parent.diff(commit)
+        else:
+            # For initial commit, compare with empty tree
+            diffs = commit.diff(git.NULL_TREE)
+            
+        # Process each changed file
+        for diff in diffs:
+            try:
+                file_path = diff.b_path if diff.b_path else diff.a_path
+                commit_info["changed_files"].append(file_path)
+                
+                # Track file history
+                if file_path not in index_data["files"]:
+                    index_data["files"][file_path] = []
+                
+                # Add commit to file history
+                index_data["files"][file_path].append(commit_hash)
+                
+                # Index file content if flag is set and file still exists in this commit
+                if index_file_content and diff.b_path:
+                    try:
+                        # Get file content from this commit
+                        blob = commit.tree / diff.b_path
+                        if blob.type == 'blob':  # Make sure it's a file, not a directory
+                            file_content = blob.data_stream.read().decode('utf-8', errors='replace')
+                            commit_info["file_content"][diff.b_path] = file_content
+                            stats["indexed_content_size_bytes"] += len(file_content)
+                            stats["indexed_files"] += 1
+                    except (UnicodeDecodeError, KeyError, git.exc.GitCommandError):
+                        # Skip binary files or other files that can't be decoded
+                        pass
+            except Exception:
+                # Skip problematic diffs
+                continue
+                
+        # Add to index
+        index_data["commits"][commit_hash] = commit_info
+        stats["indexed_commits"] += 1
+        
+    # Update last indexed timestamp
+    index_data["last_indexed"] = datetime.datetime.now().isoformat()
+    
+    return stats
+
+def git_search_commits(repo: git.Repo, query: str, max_results: int = 10, 
+                       search_file_content: bool = True, search_commit_messages: bool = True,
+                       search_file_paths: bool = True, since_date: str | None = None,
+                       author: str | None = None) -> list:
+    """
+    Search indexed commits for matching content.
+    Returns a list of matching commits with details about matches.
+    """
+    repo_path = repo.working_dir
+    
+    # Check if commits are indexed
+    if repo_path not in commit_index or not commit_index[repo_path]["commits"]:
+        # Index commits first
+        git_index_commits(repo)
+        
+    index_data = commit_index[repo_path]
+    results = []
+    
+    # Parse date filter if provided
+    date_filter = None
+    if since_date:
+        try:
+            date_filter = datetime.datetime.fromisoformat(since_date)
+        except ValueError:
+            # If date parsing fails, ignore the filter
+            pass
+    
+    # Search through indexed commits
+    for commit_hash, commit_info in index_data["commits"].items():
+        matches = []
+        
+        # Apply date filter if set
+        if date_filter:
+            commit_date = datetime.datetime.fromisoformat(commit_info["date"])
+            if commit_date < date_filter:
+                continue
+                
+        # Apply author filter if set
+        if author and author.lower() not in commit_info["author"].lower() and author.lower() not in commit_info["author_email"].lower():
+            continue
+            
+        # Search commit message
+        if search_commit_messages and query.lower() in commit_info["message"].lower():
+            matches.append({
+                "type": "commit_message",
+                "content": commit_info["message"]
+            })
+
+        # Search file paths
+        if search_file_paths:
+            for file_path in commit_info["changed_files"]:
+                if query.lower() in file_path.lower():
+                    matches.append({
+                        "type": "file_path",
+                        "path": file_path
+                    })
+
+        # Search file content
+        if search_file_content and "file_content" in commit_info:
+            for file_path, content in commit_info["file_content"].items():
+                if query.lower() in content.lower():
+                    # Find matching lines
+                    matching_lines = []
+                    for i, line in enumerate(content.splitlines(), 1):
+                        if query.lower() in line.lower():
+                            matching_lines.append({
+                                "line_number": i,
+                                "line": line.strip()
+                            })
+                            
+                    if matching_lines:
+                        matches.append({
+                            "type": "file_content",
+                            "path": file_path,
+                            "lines": matching_lines[:5]  # Limit to 5 matching lines per file
+                        })
+                        
+        # Add to results if there are matches
+        if matches:
+            results.append({
+                "commit": commit_info["short_hash"],
+                "full_hash": commit_hash,
+                "author": commit_info["author"],
+                "date": commit_info["date"],
+                "message": commit_info["message"].split("\n")[0],  # First line of message
+                "matches": matches
+            })
+            
+            # Stop if we've reached max_results
+            if len(results) >= max_results:
+                break
+                
+    return results
+
+@mcp.tool()
+def git_status_tool(repo_path: str, ctx: Context) -> str:
+    """Shows the working tree status."""
+    try:
+        repo = git.Repo(repo_path)
+        status = git_status(repo)
+        return f"Project path: {repo_path}\nGit repository status:\n{status}"
+    except git.InvalidGitRepositoryError:
+        return f"Error: {repo_path} is not a valid Git repository."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+def git_show_tool(repo_path: str, revision: str, ctx: Context) -> str:
+    """Shows the contents of a commit."""
+    try:
+        repo = git.Repo(repo_path)
+        result = git_show(repo, revision)
+        return f"Project path: {repo_path}\nGit show result: {result}"
+    except git.InvalidGitRepositoryError:
+        return f"Error: {repo_path} is not a valid Git repository."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+def git_log_tool(repo_path: str, max_count: int = 10) -> str:
+    """Shows the commit logs."""
+    try:
+        repo = git.Repo(repo_path)
+        log = git_log(repo, max_count)
+        return f"Project path: {repo_path}\nCommit history:\n" + "\n".join(log)
+    except git.InvalidGitRepositoryError:
+        return f"Error: {repo_path} is not a valid Git repository."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+def git_index_commits_tool(repo_path: str, ctx: Context, max_commits: int = 100, index_file_content: bool = True) -> str:
+    """
+    Index commit history for searching.
+    This creates a local database of commits that can be searched efficiently.
+    """
+    try:
+        global commit_index
+        repo = git.Repo(repo_path)
+        
+        # Index the commits
+        stats = git_index_commits(repo, max_commits, index_file_content)
+        
+        # Store stats in context if available
+        if hasattr(ctx, 'request_context') and hasattr(ctx.request_context, 'lifespan_context'):
+            ctx.request_context.lifespan_context.commit_index_stats = stats
+            
+            # Save commit index to disk if we have settings
+            if hasattr(ctx.request_context.lifespan_context, 'settings'):
+                settings = ctx.request_context.lifespan_context.settings
+                try:
+                    os.makedirs(settings.settings_path, exist_ok=True)
+                    with open(os.path.join(settings.settings_path, "commit_index.json"), "w") as f:
+                        json.dump(commit_index, f)
+                except Exception as e:
+                    ctx.info(f"Failed to save commit index: {e}")
+        
+        # Format the result message
+        result = f"Project path: {repo_path}\n"
+        result += f"Successfully indexed {stats['indexed_commits']} commits with {stats['indexed_files']} files.\n"
+        result += f"Total indexed content: {stats['indexed_content_size_bytes'] / (1024*1024):.2f} MB"
+        
+        return result
+    except git.InvalidGitRepositoryError:
+        return f"Error: {repo_path} is not a valid Git repository."
+    except Exception as e:
+        return f"Error indexing commits: {str(e)}"
+
+@mcp.tool()
+def git_search_commits_tool(repo_path: str, query: str, ctx: Context, max_results: int = 10, 
+                        search_file_content: bool = True, search_commit_messages: bool = True,
+                        search_file_paths: bool = True, since_date: str = None,
+                        author: str = None) -> Dict:
+    """
+    Search through indexed commits for code, messages, or file paths matching the query.
+    """
+    global commit_index
+    
+    try:
+
+        repo = git.Repo(repo_path)
+        
+        # Check if commits are indexed
+        if repo_path not in commit_index or "commits" not in commit_index[repo_path]:
+            # Auto-index if not already indexed
+            ctx.info(f"Commits not yet indexed. Indexing up to 100 commits...")
+            git_index_commits(repo)
+            
+            # Save commit index to disk if context has settings
+            if hasattr(ctx, 'request_context') and hasattr(ctx.request_context, 'lifespan_context'):
+                if hasattr(ctx.request_context.lifespan_context, 'settings'):
+                    settings = ctx.request_context.lifespan_context.settings
+                    try:
+                        os.makedirs(settings.settings_path, exist_ok=True)
+                        with open(os.path.join(settings.settings_path, "commit_index.json"), "w") as f:
+                            json.dump(commit_index, f)
+                    except Exception as e:
+                        ctx.info(f"Failed to save commit index: {e}")
+        
+        # Search the commits
+        results = git_search_commits(
+            repo, query, max_results, search_file_content, 
+            search_commit_messages, search_file_paths, since_date, author
+        )
+        
+        # Return the results
+        return {
+            "query": query,
+            "total_results": len(results),
+            "results": results,
+            "project_path": repo_path,
+        }
+    except git.InvalidGitRepositoryError:
+        return {"error": f"{repo_path} is not a valid Git repository."}
+    except Exception as e:
+        return {"error": f"Error searching commits: {commit_index}, {str(e)}"}
+
+
 @mcp.tool()
 def index_github_repo(repo_url: str, ctx: Context, branch: Optional[str] = None) -> str:
     """
@@ -226,7 +546,9 @@ def index_github_repo(repo_url: str, ctx: Context, branch: Optional[str] = None)
         # This will correctly set up all the context for us
         set_result = set_project_path(target_path, ctx)
         
-        return f"{clone_result}\n\n{set_result}"
+        index_result = git_index_commits_tool(target_path, ctx)
+        
+        return f"Project path: {target_path}\n{clone_result}\n\n{set_result}\n\n{index_result}"
     except Exception as e:
         return f"Error cloning and setting project: {str(e)}"
 
@@ -304,21 +626,21 @@ def set_project_path(path: str, ctx: Context) -> str:
         }
         ctx.request_context.lifespan_context.settings.save_config(config)
         
-        return f"Project path set to: {abs_path}. Indexed {file_count} files."
+        return f"Project path set to: `{abs_path}`. Indexed {file_count} files in the project."
     except Exception as e:
         return f"Error setting project path: {e}"
 
 @mcp.tool()
-def search_code(query: str, input_path: str, ctx: Context, extensions: Optional[List[str]] = None, case_sensitive: bool = False) -> Dict[str, List[Tuple[int, str]]]:
+def search_code(query: str, project_path: str, ctx: Context, extensions: Optional[List[str]] = None, case_sensitive: bool = False) -> Dict[str, List[Tuple[int, str]]]:
     """
     Search for code matches within the indexed files.
     Returns a dictionary mapping filenames to lists of (line_number, line_content) tuples.
     """
-    input_path = os.path.normpath(input_path)
-    if input_path.startswith('..'):
-        return {"error": f"Invalid file path: {input_path}"}
+    project_path = os.path.normpath(project_path)
+    if project_path.startswith('..'):
+        return {"error": f"Invalid file path: {project_path}"}
 
-    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else project_path
     
     # Check if base_path is set
     if not base_path:
@@ -346,7 +668,7 @@ def search_code(query: str, input_path: str, ctx: Context, extensions: Optional[
         
         try:
             # Get file content (from cache if available)
-            if file_path in code_content_cache:
+            if False:
                 content = code_content_cache[file_path]
             else:
                 full_path = os.path.join(base_path, file_path)
@@ -367,19 +689,20 @@ def search_code(query: str, input_path: str, ctx: Context, extensions: Optional[
     
     # Save the updated cache
     ctx.request_context.lifespan_context.settings.save_cache(code_content_cache)
-    
+    if len(results) > 0:
+        results["Project path"] = base_path
     return results
 
 @mcp.tool()
-def find_files(pattern: str, input_path: str, ctx: Context) -> List[str]:
+def find_files(pattern: str, project_path: str, ctx: Context) -> List[str]:
     """
     Find files in the project that match the given pattern.
     Supports glob patterns like *.py or **/*.js.
     """
-    input_path = os.path.normpath(input_path)
-    if input_path.startswith('..'):
-        return {"error": f"Invalid file path: {input_path}"}
-    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
+    project_path = os.path.normpath(project_path)
+    if project_path.startswith('..'):
+        return {"error": f"Invalid file path: {project_path}"}
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else project_path
     
     # Check if base_path is set
     if not base_path:
@@ -395,11 +718,12 @@ def find_files(pattern: str, input_path: str, ctx: Context) -> List[str]:
     for file_path, _info in _get_all_files(file_index):
         if fnmatch.fnmatch(file_path, pattern):
             matching_files.append(file_path)
-    
+    if len(matching_files) > 0:
+        matching_files.append(f"Project path: {base_path}") 
     return matching_files
 
 @mcp.tool()
-def get_file_summary(file_path: str, input_path: str, ctx: Context, include_file_content: bool = False) -> Dict[str, Any]:
+def get_file_summary(file_path: str, project_path: str, ctx: Context, include_file_content: bool = False) -> Dict[str, Any]:
     """
     Get a summary of a specific file, including:
     - Line count
@@ -407,10 +731,10 @@ def get_file_summary(file_path: str, input_path: str, ctx: Context, include_file
     - Import statements
     - Basic complexity metrics
     """
-    input_path = os.path.normpath(input_path)
-    if input_path.startswith('..'):
-        return {"error": f"Invalid file path: {input_path}"}
-    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
+    project_path = os.path.normpath(project_path)
+    if project_path.startswith('..'):
+        return {"error": f"Invalid file path: {project_path}"}
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else project_path
     
     # Check if base_path is set
     if not base_path:
@@ -425,7 +749,7 @@ def get_file_summary(file_path: str, input_path: str, ctx: Context, include_file
     
     try:
         # Get file content
-        if norm_path in code_content_cache:
+        if False:
             content = code_content_cache[norm_path]
         else:
             with open(full_path, 'r', encoding='utf-8') as f:
@@ -443,6 +767,7 @@ def get_file_summary(file_path: str, input_path: str, ctx: Context, include_file
         
         
         summary = {
+            "project_path": base_path,
             "file_path": norm_path,
             "line_count": line_count,
             "size_bytes": os.path.getsize(full_path),
@@ -533,13 +858,13 @@ def get_file_summary(file_path: str, input_path: str, ctx: Context, include_file
         return {"error": f"Error analyzing file: {e}"}
 
 @mcp.tool()
-def refresh_index(input_path: str, ctx: Context) -> str:
+def refresh_index(project_path: str, ctx: Context) -> str:
     """Refresh the project index."""
-    input_path = os.path.normpath(input_path)
-    if input_path.startswith('..'):
-        return {"error": f"Invalid file path: {input_path}"}
+    project_path = os.path.normpath(project_path)
+    if project_path.startswith('..'):
+        return {"error": f"Invalid file path: {project_path}"}
 
-    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else input_path
+    base_path = ctx.request_context.lifespan_context.base_path if ctx.request_context.lifespan_context.base_path else project_path
 
     # Check if base_path is set
     if not base_path:
@@ -569,7 +894,7 @@ def refresh_index(input_path: str, ctx: Context) -> str:
         'last_indexed': ctx.request_context.lifespan_context.settings._get_timestamp()
     })
     
-    return f"Project re-indexed. Found {file_count} files."
+    return f"Project path: `{base_path}` re-indexed. Found {file_count} files."
 
 @mcp.tool()
 def get_settings_info(ctx: Context) -> Dict[str, Any]:
@@ -660,8 +985,8 @@ def set_project() -> list[types.PromptMessage]:
         Before I can help you analyze any code, we need to set up the project path. This is a required first step.
         
         Please provide the full path to your project folder. For example:
-        - Windows: "C:/Users/input_path/projects/my-project"
-        - macOS/Linux: "/home/input_path/projects/my-project"
+        - Windows: "C:/Users/project_path/projects/my-project"
+        - macOS/Linux: "/home/project_path/projects/my-project"
         
         Once you provide the path, I'll use the `set_project_path` tool to configure the code analyzer to work with your project.
         """))
